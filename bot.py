@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
+
 def get_user(uid, name):
     cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
     user = cur.fetchone()
@@ -35,9 +36,11 @@ def get_user(uid, name):
     if not user:
         cur.execute("INSERT INTO users (user_id, name) VALUES (?,?)", (uid, name))
         conn.commit()
+        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+        user = cur.fetchone()
 
-    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
-    return cur.fetchone()
+    return user
+
 
 def update_rating(winners, losers):
     for uid in winners:
@@ -46,29 +49,37 @@ def update_rating(winners, losers):
         cur.execute("UPDATE users SET rating = rating - 5, losses = losses + 1 WHERE user_id=?", (uid,))
     conn.commit()
 
+
 # ================= GAME =================
 
 class Game:
-    def __init__(self):
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
         self.players = {}
-        self.active = False
-        self.chat_id = None
         self.night = False
         self.victim = None
         self.saved = None
-        self.trapped = None
-        self.checked = None
         self.votes = {}
 
     def alive(self):
         return {uid: p for uid, p in self.players.items() if p["alive"]}
 
-    def reset(self):
-        self.__init__()
+    def clear(self):
+        self.victim = None
+        self.saved = None
+        self.votes = {}
 
-game = Game()
 
-ROLES = ["killer", "sheriff", "doctor", "hitchhiker", "cook", "civilian"]
+games = {}
+
+ROLES = ["killer", "doctor", "sheriff", "civilian"]
+
+
+def get_game(chat_id):
+    if chat_id not in games:
+        games[chat_id] = Game(chat_id)
+    return games[chat_id]
+
 
 # ================= UI =================
 
@@ -78,10 +89,12 @@ def main_menu():
         [InlineKeyboardButton(text="📊 Профиль", callback_data="profile")]
     ])
 
+
 def join_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚪 Войти", callback_data="join")]
     ])
+
 
 def role_kb(role):
     buttons = []
@@ -90,20 +103,16 @@ def role_kb(role):
         buttons.append([InlineKeyboardButton(text="🔪 Убить", callback_data="kill_menu")])
     if role == "doctor":
         buttons.append([InlineKeyboardButton(text="🛡 Спасти", callback_data="save_menu")])
-    if role == "sheriff":
-        buttons.append([InlineKeyboardButton(text="🚨 Арест", callback_data="arrest_menu")])
-    if role == "hitchhiker":
-        buttons.append([InlineKeyboardButton(text="🪤 Ловушка", callback_data="trap_menu")])
-    if role == "cook":
-        buttons.append([InlineKeyboardButton(text="🍖 Проверить", callback_data="check_menu")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
-def target_kb(action):
+
+def target_kb(action, game, uid):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=p["name"], callback_data=f"{action}:{uid}")]
-        for uid, p in game.alive().items()
+        [InlineKeyboardButton(text=p["name"], callback_data=f"{action}:{id}")]
+        for id, p in game.alive().items() if id != uid
     ])
+
 
 # ================= START =================
 
@@ -111,115 +120,91 @@ def target_kb(action):
 async def start(msg: Message):
     await msg.answer("🪚 *Техасская резня*", reply_markup=main_menu(), parse_mode="Markdown")
 
-# ================= PROFILE =================
 
 @dp.callback_query(F.data == "profile")
 async def profile(call: CallbackQuery):
     user = get_user(call.from_user.id, call.from_user.full_name)
 
-    text = (
-        f"📊 *Профиль*\n\n"
-        f"👤 {user[1]}\n"
-        f"🏆 Рейтинг: {user[2]}\n"
-        f"✅ Победы: {user[3]}\n"
-        f"❌ Поражения: {user[4]}"
+    await call.message.answer(
+        f"📊 *Профиль*\n\n👤 {user[1]}\n🏆 {user[2]}",
+        parse_mode="Markdown"
     )
 
-    await call.message.answer(text, parse_mode="Markdown")
 
 # ================= GAME =================
 
 @dp.callback_query(F.data == "newgame")
 async def newgame(call: CallbackQuery):
-    game.reset()
-    game.active = True
-    game.chat_id = call.message.chat.id
+    game = get_game(call.message.chat.id)
+    game.players = {}
 
-    await call.message.answer("🏚 *Игра началась!*\nЖми кнопку:", reply_markup=join_kb(), parse_mode="Markdown")
+    await call.message.answer("🏚 Игра создана!", reply_markup=join_kb())
 
-    asyncio.create_task(auto_start())
+    asyncio.create_task(start_game(game))
+
 
 @dp.callback_query(F.data == "join")
 async def join(call: CallbackQuery):
-    uid = call.from_user.id
+    game = get_game(call.message.chat.id)
 
-    game.players[uid] = {
+    game.players[call.from_user.id] = {
         "name": call.from_user.full_name,
         "role": None,
-        "alive": True,
-        "team": None
+        "alive": True
     }
 
-    get_user(uid, call.from_user.full_name)
+    get_user(call.from_user.id, call.from_user.full_name)
 
-    await call.answer("Ты в игре")
+    await call.answer("Ты вошёл")
+
 
 # ================= START GAME =================
 
-async def auto_start():
-    await asyncio.sleep(15)
-    await start_game()
+async def start_game(game):
+    await asyncio.sleep(10)
 
-async def start_game():
-    roles = ROLES.copy()
-    random.shuffle(roles)
+    players = list(game.players.keys())
+    random.shuffle(players)
 
-    for i, uid in enumerate(game.players):
-        role = roles[i]
+    for i, uid in enumerate(players):
+        role = ROLES[i % len(ROLES)]
         game.players[uid]["role"] = role
-        game.players[uid]["team"] = "evil" if role in ["killer", "hitchhiker", "cook"] else "good"
 
-        await bot.send_message(uid, f"🎭 *Роль:* {role}", reply_markup=role_kb(role), parse_mode="Markdown")
-
-    await notify_family()
+        await bot.send_message(uid, f"🎭 Твоя роль: {role}", reply_markup=role_kb(role))
 
     game.night = True
-    await bot.send_message(game.chat_id, "🌑 *Ночь началась...*", parse_mode="Markdown")
-    asyncio.create_task(night_phase())
+    await bot.send_message(game.chat_id, "🌑 Ночь")
+    asyncio.create_task(night_phase(game))
 
-# ================= FAMILY =================
-
-async def notify_family():
-    family = [p for p in game.players.values() if p["team"] == "evil"]
-
-    text = "\n".join([f"🔪 {p['name']}" for p in family])
-
-    for uid, p in game.players.items():
-        if p["team"] == "evil":
-            await bot.send_message(uid, f"👥 *Семья:*\n{text}", parse_mode="Markdown")
 
 # ================= ACTIONS =================
 
 @dp.callback_query(F.data.endswith("_menu"))
 async def open_menu(call: CallbackQuery):
+    game = get_game(call.message.chat.id)
     action = call.data.replace("_menu", "")
-    await call.message.answer("Выбери цель:", reply_markup=target_kb(action))
+
+    await call.message.answer("Выбери цель:", reply_markup=target_kb(action, game, call.from_user.id))
+
 
 @dp.callback_query(F.data.startswith("kill:"))
 async def kill(call: CallbackQuery):
+    game = get_game(call.message.chat.id)
     game.victim = int(call.data.split(":")[1])
-    await call.answer("Цель выбрана")
+    await call.answer("Выбран")
+
 
 @dp.callback_query(F.data.startswith("save:"))
 async def save(call: CallbackQuery):
+    game = get_game(call.message.chat.id)
     game.saved = int(call.data.split(":")[1])
     await call.answer("Спасён")
 
-@dp.callback_query(F.data.startswith("trap:"))
-async def trap(call: CallbackQuery):
-    game.trapped = int(call.data.split(":")[1])
-    await call.answer("В ловушке")
-
-@dp.callback_query(F.data.startswith("check:"))
-async def check(call: CallbackQuery):
-    uid = int(call.data.split(":")[1])
-    role = game.players[uid]["role"]
-    await call.message.answer(f"🍖 Его роль: *{role}*", parse_mode="Markdown")
 
 # ================= NIGHT =================
 
-async def night_phase():
-    await asyncio.sleep(15)
+async def night_phase(game):
+    await asyncio.sleep(10)
 
     if game.victim and game.victim != game.saved:
         game.players[game.victim]["alive"] = False
@@ -228,65 +213,28 @@ async def night_phase():
         await bot.send_message(game.chat_id, "😶 Никто не умер")
 
     game.night = False
-    await start_day()
+    asyncio.create_task(day_phase(game))
+
 
 # ================= DAY =================
 
-async def start_day():
-    await bot.send_message(game.chat_id, "☀️ *День. Голосуйте!*", reply_markup=target_kb("vote"), parse_mode="Markdown")
-    asyncio.create_task(day_phase())
+async def day_phase(game):
+    await bot.send_message(game.chat_id, "☀️ День")
 
-@dp.callback_query(F.data.startswith("vote:"))
-async def vote(call: CallbackQuery):
-    uid = int(call.data.split(":")[1])
-    game.votes[uid] = game.votes.get(uid, 0) + 1
-    await call.answer("Голос принят")
+    await asyncio.sleep(10)
 
-async def day_phase():
-    await asyncio.sleep(15)
-
-    if game.votes:
-        target = max(game.votes, key=game.votes.get)
-        game.players[target]["alive"] = False
-        await bot.send_message(game.chat_id, f"☠️ Казнён: {game.players[target]['name']}")
-
-    game.votes = {}
-
-    if check_win():
-        return
-
+    game.clear()
     game.night = True
-    await bot.send_message(game.chat_id, "🌑 Новая ночь")
-    asyncio.create_task(night_phase())
 
-# ================= WIN =================
+    await bot.send_message(game.chat_id, "🌑 Ночь снова")
+    asyncio.create_task(night_phase(game))
 
-def check_win():
-    alive = game.alive()
-    killers = [p for p in alive.values() if p["team"] == "evil"]
-
-    if not killers:
-        winners = [uid for uid, p in game.players.items() if p["team"] == "good"]
-        losers = [uid for uid, p in game.players.items() if p["team"] == "evil"]
-
-        update_rating(winners, losers)
-        asyncio.create_task(bot.send_message(game.chat_id, "🏆 Мирные победили"))
-        return True
-
-    if len(killers) >= len(alive) - len(killers):
-        winners = [uid for uid, p in game.players.items() if p["team"] == "evil"]
-        losers = [uid for uid, p in game.players.items() if p["team"] == "good"]
-
-        update_rating(winners, losers)
-        asyncio.create_task(bot.send_message(game.chat_id, "💀 Маньяки победили"))
-        return True
-
-    return False
 
 # ================= RUN =================
 
 async def main():
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
